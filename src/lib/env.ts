@@ -16,6 +16,8 @@ const optionalNonEmptyString = z.preprocess(
 );
 
 const envSchema = z.object({
+  EXA_API_KEY: optionalNonEmptyString,
+  EXA_MCP_URL: z.string().url().default("https://mcp.exa.ai/mcp"),
   OPENROUTER_API_KEY: optionalNonEmptyString,
   OPENROUTER_MODEL: z.string().default("openai/gpt-4.1-mini"),
   OPENROUTER_HTTP_REFERER: z.string().url().default("http://localhost:3000"),
@@ -39,6 +41,8 @@ const publicEnvSchema = z.object({
 });
 
 export const env = envSchema.parse({
+  EXA_API_KEY: process.env.EXA_API_KEY,
+  EXA_MCP_URL: process.env.EXA_MCP_URL,
   OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
   OPENROUTER_MODEL: process.env.OPENROUTER_MODEL,
   OPENROUTER_HTTP_REFERER: process.env.OPENROUTER_HTTP_REFERER,

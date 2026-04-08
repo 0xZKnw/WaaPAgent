@@ -19,6 +19,14 @@ export interface SwapDraftInput {
   slippageBps: number;
 }
 
+export interface NftTransferDraftInput {
+  recipientAddress: string;
+  contractAddress: string;
+  tokenId: string;
+  tokenType: string;
+  quantity?: string;
+}
+
 export class PolicyService {
   private readonly maxTransferWei = parseEther(env.MAX_NATIVE_TRANSFER_ETH);
   private readonly maxSwapUsd = Number(env.MAX_SWAP_USD);
@@ -86,6 +94,38 @@ export class PolicyService {
       tokenOut,
       estimatedValueUsd: input.estimatedValueUsd,
       slippageBps: input.slippageBps,
+    };
+  }
+
+  assertNftTransferInput(input: NftTransferDraftInput) {
+    if (!isAddress(input.recipientAddress)) {
+      throw new Error("NFT recipient address is not valid.");
+    }
+
+    if (!isAddress(input.contractAddress)) {
+      throw new Error("NFT contract address is not valid.");
+    }
+
+    if (!input.tokenId.trim()) {
+      throw new Error("NFT token id is required.");
+    }
+
+    const quantity = input.quantity?.trim() || "1";
+
+    if (!/^[0-9]+$/.test(quantity) || BigInt(quantity) <= 0n) {
+      throw new Error("NFT quantity must be a positive integer.");
+    }
+
+    if (input.tokenType !== "ERC-721" && input.tokenType !== "ERC-1155") {
+      throw new Error("NFT transfers are limited to ERC-721 and ERC-1155.");
+    }
+
+    return {
+      recipientAddress: getAddress(input.recipientAddress),
+      contractAddress: getAddress(input.contractAddress),
+      tokenId: input.tokenId.trim(),
+      tokenType: input.tokenType as "ERC-721" | "ERC-1155",
+      quantity,
     };
   }
 

@@ -85,6 +85,41 @@ describe("PolicyService", () => {
     expect(result.tokenOut.symbol).toBe("USDC");
   });
 
+  test("accepts valid ERC-721 and ERC-1155 NFT transfer previews", () => {
+    const result = policy.assertNftTransferInput({
+      recipientAddress: "0x1111111111111111111111111111111111111111",
+      contractAddress: "0x2222222222222222222222222222222222222222",
+      tokenId: "42",
+      tokenType: "ERC-721",
+    });
+
+    expect(result.tokenId).toBe("42");
+    expect(result.quantity).toBe("1");
+
+    const erc1155Result = policy.assertNftTransferInput({
+      recipientAddress: "0x1111111111111111111111111111111111111111",
+      contractAddress: "0x2222222222222222222222222222222222222222",
+      tokenId: "42",
+      tokenType: "ERC-1155",
+      quantity: "3",
+    });
+
+    expect(erc1155Result.quantity).toBe("3");
+    expect(erc1155Result.tokenType).toBe("ERC-1155");
+  });
+
+  test("rejects invalid NFT quantities", () => {
+    expect(() =>
+      policy.assertNftTransferInput({
+        recipientAddress: "0x1111111111111111111111111111111111111111",
+        contractAddress: "0x2222222222222222222222222222222222222222",
+        tokenId: "42",
+        tokenType: "ERC-1155",
+        quantity: "0",
+      }),
+    ).toThrow("NFT quantity must be a positive integer.");
+  });
+
   test("rejects unsupported or oversized swaps", () => {
     expect(() =>
       policy.assertSwapInput({

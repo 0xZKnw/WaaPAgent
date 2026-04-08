@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
 
 import { and, desc, eq, gt } from "drizzle-orm";
-import { createPublicClient, formatEther, getAddress, http, parseEther } from "viem";
+import {
+  createPublicClient,
+  encodeFunctionData,
+  formatEther,
+  getAddress,
+  http,
+  parseAbi,
+  parseEther,
+} from "viem";
 import { sepolia } from "viem/chains";
 
 import {
@@ -11,6 +19,7 @@ import {
 } from "@/lib/constants";
 import { env } from "@/lib/env";
 import type {
+  NftTransferActionMetadata,
   PendingWalletAction,
   PermissionGrant,
   PermissionGrantInput,
@@ -25,12 +34,17 @@ import {
   permissionGrants,
 } from "@/server/db/schema";
 import { PolicyService } from "@/server/services/policy-service";
+import { NftAssetService } from "@/server/services/nft-asset-service";
 import { TokenBalanceService } from "@/server/services/token-balance-service";
 import { UniswapTradeService } from "@/server/services/uniswap-trade-service";
 
 interface SessionShape {
   id: string;
   address: string;
+}
+
+interface WalletContextOptions {
+  includeNfts?: boolean;
 }
 
 interface TransferIntent {
@@ -46,10 +60,27 @@ interface SwapIntent {
   reason?: string;
 }
 
+interface NftTransferIntent {
+  contractAddress: string;
+  tokenId: string;
+  toAddress: string;
+  quantity?: string;
+  reason?: string;
+}
+
+const erc721TransferAbi = parseAbi([
+  "function safeTransferFrom(address from,address to,uint256 tokenId)",
+]);
+
+const erc1155TransferAbi = parseAbi([
+  "function safeTransferFrom(address from,address to,uint256 id,uint256 value,bytes data)",
+]);
+
 export class WaapWalletService {
   constructor(
     private readonly policyService = new PolicyService(),
     private readonly tokenBalanceService = new TokenBalanceService(),
+    private readonly nftAssetService = new NftAssetService(),
     private readonly uniswapTradeService = new UniswapTradeService(),
   ) {}
 
@@ -69,13 +100,19 @@ export class WaapWalletService {
     };
   }
 
-  async getWalletContext(session: SessionShape): Promise<WalletContext> {
+  async getWalletContext(
+    session: SessionShape,
+    options: WalletContextOptions = {},
+  ): Promise<WalletContext> {
     ensureDatabase();
 
     const balance = await this.getNativeBalance(session.address);
     const tokenBalances = await this.tokenBalanceService
       .getTokenBalances(session.address)
       .catch(() => []);
+    const nftAssets = options.includeNfts
+      ? await this.nftAssetService.getOwnedNfts(session.address).catch(() => [])
+      : [];
     const activePermission = this.getActivePermissionGrant(session.id);
     const recentActions = this.listRecentActions(session.id);
 
@@ -86,10 +123,17 @@ export class WaapWalletService {
       nativeBalanceWei: balance.nativeBalanceWei,
       nativeBalanceEth: balance.nativeBalanceEth,
       tokenBalances,
+      nftAssets,
       swapAvailable: this.uniswapTradeService.isConfigured(),
+      supportedSwapTokens: this.uniswapTradeService.listSupportedTokens(),
       activePermission,
       recentActions,
     };
+  }
+
+  async getWalletNfts(session: SessionShape) {
+    ensureDatabase();
+    return this.nftAssetService.getOwnedNfts(session.address).catch(() => []);
   }
 
   createTransferPreview(session: SessionShape, intent: TransferIntent) {
@@ -159,6 +203,88 @@ export class WaapWalletService {
     };
   }
 
+  async createNftTransferPreview(session: SessionShape, intent: NftTransferIntent) {
+    const ownedAsset = await this.nftAssetService.findOwnedNft(
+      session.address,
+      intent.contractAddress,
+      intent.tokenId,
+    );
+
+    if (!ownedAsset) {
+      throw new Error("This NFT is not currently detected in the connected wallet.");
+    }
+
+    const validated = this.policyService.assertNftTransferInput({
+      recipientAddress: intent.toAddress,
+      contractAddress: intent.contractAddress,
+      tokenId: intent.tokenId,
+      tokenType: ownedAsset.tokenType,
+      quantity: intent.quantity,
+    });
+
+    if (ownedAsset.tokenType === "ERC-1155" && BigInt(validated.quantity) > BigInt(ownedAsset.balance)) {
+      throw new Error("The requested ERC-1155 quantity exceeds the wallet balance.");
+    }
+
+    const transferTx =
+      validated.tokenType === "ERC-1155"
+        ? {
+            to: validated.contractAddress,
+            chainId: SEPOLIA_CHAIN_ID,
+            value: "0",
+            data: encodeFunctionData({
+              abi: erc1155TransferAbi,
+              functionName: "safeTransferFrom",
+              args: [
+                getAddress(session.address),
+                validated.recipientAddress,
+                BigInt(validated.tokenId),
+                BigInt(validated.quantity),
+                "0x",
+              ],
+            }),
+          }
+        : {
+            to: validated.contractAddress,
+            chainId: SEPOLIA_CHAIN_ID,
+            value: "0",
+            data: encodeFunctionData({
+              abi: erc721TransferAbi,
+              functionName: "safeTransferFrom",
+              args: [
+                getAddress(session.address),
+                validated.recipientAddress,
+                BigInt(validated.tokenId),
+              ],
+            }),
+          };
+
+    const metadata: NftTransferActionMetadata = {
+      kind: "nft_transfer",
+      tokenType: validated.tokenType,
+      contractAddress: validated.contractAddress,
+      tokenId: validated.tokenId,
+      quantity: validated.quantity,
+      collectionName: ownedAsset.collectionName,
+      collectionSymbol: ownedAsset.collectionSymbol,
+      assetName: ownedAsset.name,
+      imageUrl: ownedAsset.imageUrl ?? null,
+      transferTx,
+    };
+
+    return {
+      chainId: SEPOLIA_CHAIN_ID,
+      toAddress: validated.recipientAddress,
+      estimatedValueUsd: "0.00",
+      summary:
+        validated.tokenType === "ERC-1155"
+          ? `Send ${validated.quantity} units of ${ownedAsset.name} from ${ownedAsset.collectionName} to ${validated.recipientAddress} on Sepolia.`
+          : `Send NFT ${ownedAsset.name} from ${ownedAsset.collectionName} to ${validated.recipientAddress} on Sepolia.`,
+      reason: intent.reason ?? null,
+      metadata,
+    };
+  }
+
   async createPendingTransfer(session: SessionShape, intent: TransferIntent) {
     ensureDatabase();
 
@@ -223,6 +349,54 @@ export class WaapWalletService {
       chainId: SEPOLIA_CHAIN_ID,
       toAddress: preview.routerAddress,
       valueWei: preview.valueWei,
+      estimatedValueUsd: preview.estimatedValueUsd,
+      summary: preview.summary,
+      reason: preview.reason,
+      requiresPermission: true,
+      canAutoExecute: false,
+      txHash: null,
+      error: null,
+      metadata: JSON.stringify(preview.metadata),
+      createdAt: now,
+      updatedAt: now,
+    } as const;
+
+    const action = this.mapPendingActionRow(draft);
+    const canAutoExecute = this.policyService.isGrantValidForAction(
+      activePermission,
+      action,
+    );
+
+    getDb()
+      .insert(pendingActions)
+      .values({
+        ...draft,
+        status: canAutoExecute ? "ready" : "needs_approval",
+        requiresPermission: !canAutoExecute,
+        canAutoExecute,
+        permissionGrantId: canAutoExecute ? activePermission?.id ?? null : null,
+      })
+      .run();
+
+    return this.getAction(session.id, draft.id);
+  }
+
+  async createPendingNftTransfer(session: SessionShape, intent: NftTransferIntent) {
+    ensureDatabase();
+
+    const preview = await this.createNftTransferPreview(session, intent);
+    const activePermission = this.getActivePermissionGrant(session.id);
+    const now = Date.now();
+
+    const draft = {
+      id: randomUUID(),
+      sessionId: session.id,
+      permissionGrantId: null,
+      type: "nft_transfer",
+      status: "needs_approval",
+      chainId: SEPOLIA_CHAIN_ID,
+      toAddress: preview.toAddress,
+      valueWei: "0",
       estimatedValueUsd: preview.estimatedValueUsd,
       summary: preview.summary,
       reason: preview.reason,
@@ -486,7 +660,9 @@ export class WaapWalletService {
       txHash: row.txHash,
       error: row.error,
       permissionGrantId: row.permissionGrantId,
-      metadata: row.metadata ? (JSON.parse(row.metadata) as SwapActionMetadata) : null,
+      metadata: row.metadata
+        ? (JSON.parse(row.metadata) as SwapActionMetadata | NftTransferActionMetadata)
+        : null,
       createdAt: new Date(row.createdAt).toISOString(),
       updatedAt: new Date(row.updatedAt).toISOString(),
     };

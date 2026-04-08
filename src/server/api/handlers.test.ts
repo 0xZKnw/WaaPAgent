@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { ChatResponse, PendingWalletAction, WalletContext } from "@/lib/types";
 import {
+  handleActionDraftRequest,
   handleAuthChallengeRequest,
   handleAuthVerifyRequest,
   handleChatRequest,
@@ -24,7 +25,18 @@ const walletContext: WalletContext = {
   nativeBalanceWei: "10000000000000000",
   nativeBalanceEth: "0.01",
   tokenBalances: [],
+  nftAssets: [],
   swapAvailable: true,
+  supportedSwapTokens: [
+    {
+      chainId: 11155111,
+      symbol: "ETH",
+      name: "Ether",
+      address: "0x0000000000000000000000000000000000000000",
+      decimals: 18,
+      isNative: true,
+    },
+  ],
   activePermission: null,
   recentActions: [],
 };
@@ -176,5 +188,29 @@ describe("API handler helpers", () => {
 
     expect(confirmation.action.id).toBe(pendingAction.id);
     expect(confirmation.action.canAutoExecute).toBe(true);
+  });
+
+  test("creates a draft action through the injected wallet service", async () => {
+    const result = await handleActionDraftRequest(
+      session.sessionToken,
+      {
+        type: "token_swap",
+        tokenIn: "ETH",
+        tokenOut: "USDC",
+        amount: "0.01",
+      },
+      {
+        sessionService: {
+          getSession: () => session,
+        } as never,
+        walletService: {
+          createPendingSwap: async () => pendingAction,
+          getWalletContext: async () => walletContext,
+        } as never,
+      },
+    );
+
+    expect(result.action.id).toBe(pendingAction.id);
+    expect(result.walletContext.supportedSwapTokens).toHaveLength(1);
   });
 });

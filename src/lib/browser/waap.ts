@@ -1,10 +1,12 @@
 "use client";
 
-import type { InitWaaPOptions, WaaPProvider } from "@human.tech/waap-sdk";
+import type {
+  InitWaaPOptions,
+  WaaPProvider,
+} from "@human.tech/waap-sdk";
 
 import {
   DEFAULT_RPC_URL,
-  SEPOLIA_CHAIN_ID,
   SEPOLIA_CHAIN_NAME,
   SEPOLIA_HEX_CHAIN_ID,
 } from "@/lib/constants";
@@ -15,6 +17,91 @@ declare global {
     waap?: WaaPProvider;
     __waapInitialized?: boolean;
   }
+}
+
+const PROVIDER_INIT_TIMEOUT_MS = 2_000;
+const ACCOUNT_RETRY_DELAYS_MS = [120, 280, 520, 900] as const;
+type WaaPLoginMethod = "waap" | "human" | "injected" | "walletconnect" | null;
+
+function delay(ms: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+export function isWaapManagedLoginMethod(loginMethod: WaaPLoginMethod) {
+  return loginMethod === "waap" || loginMethod === "human";
+}
+
+async function waitForWaapProvider() {
+  const startedAt = Date.now();
+
+  while (!window.waap) {
+    if (Date.now() - startedAt >= PROVIDER_INIT_TIMEOUT_MS) {
+      break;
+    }
+
+    await delay(40);
+  }
+
+  return window.waap;
+}
+
+export async function getWaapAccounts(waap: WaaPProvider) {
+  const accounts = (await waap.request({
+    method: "eth_accounts",
+  })) as string[];
+
+  return accounts.filter(Boolean);
+}
+
+export async function requestWaapAccounts(
+  waap: WaaPProvider,
+  options: { interactive?: boolean; preferWaapLogin?: boolean } = {},
+) {
+  const { interactive = false, preferWaapLogin = false } = options;
+
+  if (interactive) {
+    const accounts = (await waap.request({
+      method: "eth_requestAccounts",
+    })) as string[];
+
+    if (accounts[0]) {
+      return accounts.filter(Boolean);
+    }
+
+    if (preferWaapLogin) {
+      const loginMethod = await waap.login();
+
+      if (loginMethod && !isWaapManagedLoginMethod(loginMethod)) {
+        await waap.logout();
+        throw new Error("Only Human Wallet sign-in is allowed in this app.");
+      }
+
+      const loginAccounts = await getWaapAccounts(waap);
+
+      if (loginAccounts[0]) {
+        return loginAccounts;
+      }
+    }
+  }
+
+  let accounts = await getWaapAccounts(waap);
+
+  if (accounts[0]) {
+    return accounts;
+  }
+
+  for (const delayMs of ACCOUNT_RETRY_DELAYS_MS) {
+    await delay(delayMs);
+    accounts = await getWaapAccounts(waap);
+
+    if (accounts[0]) {
+      return accounts;
+    }
+  }
+
+  return accounts;
 }
 
 export async function ensureWaap() {
@@ -49,22 +136,27 @@ export async function ensureWaap() {
       },
     };
 
-    initWaaP(options);
+    const provider = initWaaP(options);
+    window.waap = provider;
     window.__waapInitialized = true;
   }
 
-  if (!window.waap) {
+  const provider = window.waap ?? (await waitForWaapProvider());
+
+  if (!provider) {
     throw new Error("Failed to initialize WaaP.");
   }
 
-  return window.waap;
+  window.waap = provider;
+
+  return provider;
 }
 
 export async function switchToSepolia(waap: WaaPProvider) {
   try {
     await waap.request({
       method: "wallet_switchEthereumChain",
-      params: [{ chainId: SEPOLIA_CHAIN_ID }],
+      params: [{ chainId: SEPOLIA_HEX_CHAIN_ID }],
     });
   } catch {
     await waap.request({

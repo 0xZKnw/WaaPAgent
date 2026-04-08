@@ -7,16 +7,25 @@ import { useEffect, useState } from "react";
 
 import { ApprovalPanel } from "@/components/approval-panel";
 import { ChatPanel } from "@/components/chat-panel";
+import { useTheme } from "@/components/providers";
 import { WalletPanel } from "@/components/wallet-panel";
 import { SEPOLIA_CHAIN_ID } from "@/lib/constants";
+import {
+  ensureWaap,
+  getWaapAccounts,
+  isWaapManagedLoginMethod,
+  requestWaapAccounts,
+  switchToSepolia,
+} from "@/lib/browser/waap";
 import { publicEnv } from "@/lib/env";
-import { ensureWaap, switchToSepolia } from "@/lib/browser/waap";
 import type {
+  AgentToolTraceItem,
   ChatMessage,
   ChatResponse,
   PendingWalletAction,
   PreparedOnchainTransaction,
   WalletContext,
+  WalletNftAsset,
 } from "@/lib/types";
 import { minutesToSeconds, nowIso, toErrorMessage } from "@/lib/utils";
 
@@ -24,6 +33,36 @@ const publicClient = createPublicClient({
   chain: sepolia,
   transport: http(publicEnv.NEXT_PUBLIC_SEPOLIA_RPC_URL),
 });
+
+const WALLET_CONTEXT_REFRESH_MS = 10_000;
+const NFT_REFRESH_MS = 60_000;
+
+type DisplayChatMessage = ChatMessage & {
+  toolTrace?: AgentToolTraceItem[];
+};
+
+type ActionDraftPayload =
+  | {
+      type: "native_transfer";
+      toAddress: string;
+      amountEth: string;
+      reason?: string;
+    }
+  | {
+      type: "token_swap";
+      tokenIn: string;
+      tokenOut: string;
+      amount: string;
+      reason?: string;
+    }
+  | {
+      type: "nft_transfer";
+      contractAddress: string;
+      tokenId: string;
+      toAddress: string;
+      quantity?: string;
+      reason?: string;
+    };
 
 async function postJson<T>(url: string, payload?: unknown) {
   const response = await fetch(url, {
@@ -62,6 +101,7 @@ async function postChat<T>(
   payload: unknown,
   handlers: {
     onDelta: (delta: string) => void;
+    onTool: (event: AgentToolTraceItem) => void;
   },
 ) {
   const response = await fetch("/api/chat", {
@@ -112,11 +152,14 @@ async function postChat<T>(
 
       const chunk = JSON.parse(line) as
         | { type: "delta"; delta: string }
+        | { type: "tool"; event: AgentToolTraceItem }
         | { type: "final"; response: T }
         | { type: "error"; error: string };
 
       if (chunk.type === "delta") {
         handlers.onDelta(chunk.delta);
+      } else if (chunk.type === "tool") {
+        handlers.onTool(chunk.event);
       } else if (chunk.type === "final") {
         finalResponse = chunk.response;
       } else if (chunk.type === "error") {
@@ -126,9 +169,14 @@ async function postChat<T>(
   }
 
   if (buffer.trim()) {
-    const chunk = JSON.parse(buffer) as { type: "final"; response: T } | { type: "error"; error: string };
+    const chunk = JSON.parse(buffer) as
+      | { type: "tool"; event: AgentToolTraceItem }
+      | { type: "final"; response: T }
+      | { type: "error"; error: string };
 
-    if (chunk.type === "final") {
+    if (chunk.type === "tool") {
+      handlers.onTool(chunk.event);
+    } else if (chunk.type === "final") {
       finalResponse = chunk.response;
     } else {
       throw new Error(chunk.error);
@@ -171,16 +219,71 @@ function toRpcTransaction(
   };
 }
 
+function getNftKey(asset: Pick<WalletNftAsset, "contractAddress" | "tokenId">) {
+  return `${asset.contractAddress}:${asset.tokenId}`;
+}
+
+function buildSuggestedPrompts(walletContext: WalletContext | null) {
+  const suggestions = ["Show my wallet overview", "What tokens do I hold?"];
+
+  if (walletContext?.nftAssets.length) {
+    suggestions.push("Show my NFTs");
+  }
+
+  if (walletContext?.swapAvailable) {
+    suggestions.push("Swap 0.01 ETH to USDC");
+  }
+
+  if (walletContext?.recentActions.length) {
+    suggestions.push("What happened in my recent actions?");
+  }
+
+  return suggestions.slice(0, 4);
+}
+
+function mergeWalletContext(base: WalletContext | null, nftAssets: WalletNftAsset[] | null) {
+  if (!base) {
+    return null;
+  }
+
+  return {
+    ...base,
+    nftAssets: nftAssets ?? base.nftAssets,
+  };
+}
+
+function upsertToolTrace(current: AgentToolTraceItem[], nextEvent: AgentToolTraceItem) {
+  const index = current.findIndex((item) => item.id === nextEvent.id);
+
+  if (index === -1) {
+    return [...current, nextEvent];
+  }
+
+  const next = [...current];
+  next[index] = nextEvent;
+  return next;
+}
+
 export function AppShell() {
+  const { theme, toggleTheme } = useTheme();
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   const [walletContext, setWalletContext] = useState<WalletContext | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [nftAssets, setNftAssets] = useState<WalletNftAsset[] | null>(null);
+  const [messages, setMessages] = useState<DisplayChatMessage[]>([]);
   const [activeAction, setActiveAction] = useState<PendingWalletAction | null>(null);
+  const [selectedNftKey, setSelectedNftKey] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
   const [restoringSession, setRestoringSession] = useState(true);
   const [streamingAssistantMessage, setStreamingAssistantMessage] = useState("");
   const [streamingAssistantActive, setStreamingAssistantActive] = useState(false);
+  const [streamingToolTrace, setStreamingToolTrace] = useState<AgentToolTraceItem[]>([]);
+  const [themeReady, setThemeReady] = useState(false);
+
+  const mergedWalletContext = mergeWalletContext(walletContext, nftAssets);
+  const selectedNft =
+    mergedWalletContext?.nftAssets.find((asset) => getNftKey(asset) === selectedNftKey) ?? null;
+  const suggestionPrompts = buildSuggestedPrompts(mergedWalletContext);
 
   const connectMutation = useMutation({
     mutationFn: async () => {
@@ -188,27 +291,22 @@ export function AppShell() {
 
       setConnectError(null);
 
-      const loginResult = await waap.login();
+      const existingLoginMethod = waap.getLoginMethod();
 
-      if (!loginResult) {
-        throw new Error("Human Wallet login was cancelled before the session started.");
+      if (existingLoginMethod && !isWaapManagedLoginMethod(existingLoginMethod)) {
+        await waap.logout();
       }
 
-      let accounts = (await waap.request({
-        method: "eth_requestAccounts",
-      })) as string[];
-
-      if (!accounts[0]) {
-        accounts = (await waap.request({
-          method: "eth_accounts",
-        })) as string[];
-      }
+      const accounts = await requestWaapAccounts(waap, {
+        interactive: true,
+        preferWaapLogin: true,
+      });
 
       const address = accounts[0];
 
       if (!address) {
         throw new Error(
-          "Human Wallet opened but no address came back. Finish the WaaP auth flow, then try again.",
+          "Human Wallet did not return an address. The sign-in window may have been closed too early. Try again.",
         );
       }
 
@@ -230,8 +328,8 @@ export function AppShell() {
       const verifyResponse = await postJson<{ walletContext?: WalletContext; address: string }>(
         "/api/auth/verify",
         {
-        address,
-        signature,
+          address,
+          signature,
         },
       );
 
@@ -240,11 +338,12 @@ export function AppShell() {
         walletContext: verifyResponse.walletContext ?? null,
       };
     },
-    onSuccess: ({ address, walletContext }) => {
+    onSuccess: ({ address, walletContext: nextWalletContext }) => {
       setWalletAddress(address);
       setConnected(true);
       setConnectError(null);
-      setWalletContext(walletContext);
+      setWalletContext(nextWalletContext);
+      setNftAssets(null);
     },
     onError: (error) => {
       setConnected(false);
@@ -261,6 +360,28 @@ export function AppShell() {
       });
       return formatEther(balance);
     },
+    refetchInterval: connected ? WALLET_CONTEXT_REFRESH_MS : false,
+    refetchIntervalInBackground: true,
+  });
+
+  const walletContextQuery = useQuery({
+    queryKey: ["wallet-context", walletAddress],
+    enabled: connected && Boolean(walletAddress),
+    queryFn: async () => {
+      return getJson<{ walletContext: WalletContext }>("/api/wallet/context");
+    },
+    refetchInterval: WALLET_CONTEXT_REFRESH_MS,
+    refetchIntervalInBackground: true,
+  });
+
+  const walletNftsQuery = useQuery({
+    queryKey: ["wallet-nfts", walletAddress],
+    enabled: connected && Boolean(walletAddress),
+    queryFn: async () => {
+      return getJson<{ nftAssets: WalletNftAsset[] }>("/api/wallet/nfts");
+    },
+    refetchInterval: NFT_REFRESH_MS,
+    refetchIntervalInBackground: false,
   });
 
   const chatMutation = useMutation({
@@ -274,11 +395,16 @@ export function AppShell() {
             setStreamingAssistantActive(true);
             setStreamingAssistantMessage((current) => current + delta);
           },
+          onTool: (event) => {
+            setStreamingAssistantActive(true);
+            setStreamingToolTrace((current) => upsertToolTrace(current, event));
+          },
         },
       ),
     onMutate: async (message) => {
       setStreamingAssistantActive(true);
       setStreamingAssistantMessage("");
+      setStreamingToolTrace([]);
       setMessages((current) => [
         ...current,
         {
@@ -292,6 +418,11 @@ export function AppShell() {
     onSuccess: (response) => {
       setStreamingAssistantActive(false);
       setStreamingAssistantMessage("");
+      const finalizedToolTrace =
+        response.toolTrace && response.toolTrace.length > 0
+          ? response.toolTrace
+          : streamingToolTrace;
+      setStreamingToolTrace([]);
       setMessages((current) => [
         ...current,
         {
@@ -299,14 +430,19 @@ export function AppShell() {
           role: "assistant",
           content: response.message,
           createdAt: nowIso(),
+          toolTrace: finalizedToolTrace,
         },
       ]);
       setWalletContext(response.walletContext);
+      if (response.walletContext.nftAssets.length) {
+        setNftAssets(response.walletContext.nftAssets);
+      }
       setActiveAction(response.pendingAction);
     },
     onError: (error) => {
       setStreamingAssistantActive(false);
       setStreamingAssistantMessage("");
+      setStreamingToolTrace([]);
       setMessages((current) => [
         ...current,
         {
@@ -316,6 +452,18 @@ export function AppShell() {
           createdAt: nowIso(),
         },
       ]);
+    },
+  });
+
+  const draftActionMutation = useMutation({
+    mutationFn: async (payload: ActionDraftPayload) =>
+      postJson<{ action: PendingWalletAction; walletContext: WalletContext }>(
+        "/api/actions/draft",
+        payload,
+      ),
+    onSuccess: (response) => {
+      setActiveAction(response.action);
+      setWalletContext(response.walletContext);
     },
   });
 
@@ -345,7 +493,9 @@ export function AppShell() {
     onSuccess: (response) => {
       setActiveAction(response.action);
       setWalletContext(response.walletContext);
-      balanceQuery.refetch();
+      void balanceQuery.refetch();
+      void walletContextQuery.refetch();
+      void walletNftsQuery.refetch();
     },
   });
 
@@ -372,7 +522,7 @@ export function AppShell() {
         throw new Error(result.error || "Permission token request was rejected.");
       }
 
-      return postJson<{ walletContext: WalletContext }>(`/api/permissions/grant`, {
+      return postJson<{ walletContext: WalletContext }>("/api/permissions/grant", {
         actionId: action.id,
         chainId: SEPOLIA_CHAIN_ID,
         actionType: action.type,
@@ -383,16 +533,9 @@ export function AppShell() {
     },
     onSuccess: (response) => {
       setWalletContext(response.walletContext);
+      void walletNftsQuery.refetch();
     },
   });
-
-  const combinedBusy =
-    restoringSession ||
-    connectMutation.isPending ||
-    chatMutation.isPending ||
-    grantPermissionMutation.isPending ||
-    confirmActionMutation.isPending ||
-    completeActionMutation.isPending;
 
   const disconnectMutation = useMutation({
     mutationFn: async () => {
@@ -403,7 +546,9 @@ export function AppShell() {
     onSuccess: () => {
       setWalletAddress(null);
       setWalletContext(null);
+      setNftAssets(null);
       setActiveAction(null);
+      setSelectedNftKey(null);
       setConnected(false);
       setConnectError(null);
       setMessages([]);
@@ -412,6 +557,22 @@ export function AppShell() {
       setConnectError(toErrorMessage(error));
     },
   });
+
+  const combinedBusy =
+    restoringSession ||
+    connectMutation.isPending ||
+    disconnectMutation.isPending ||
+    chatMutation.isPending ||
+    draftActionMutation.isPending ||
+    grantPermissionMutation.isPending ||
+    confirmActionMutation.isPending ||
+    completeActionMutation.isPending;
+
+  const resolvedTheme = themeReady ? theme : "light";
+
+  useEffect(() => {
+    setThemeReady(true);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -425,17 +586,13 @@ export function AppShell() {
           return;
         }
 
-        const accounts = (await waap.request({
-          method: "eth_requestAccounts",
-        })) as string[];
+        if (!isWaapManagedLoginMethod(loginMethod)) {
+          await waap.logout();
+          return;
+        }
 
-        const address =
-          accounts[0] ||
-          (
-            (await waap.request({
-              method: "eth_accounts",
-            })) as string[]
-          )[0];
+        const accounts = await getWaapAccounts(waap);
+        const address = accounts[0];
 
         if (!address || cancelled) {
           return;
@@ -453,6 +610,7 @@ export function AppShell() {
         setConnected(true);
         setConnectError(null);
         setWalletContext(contextResponse?.walletContext ?? null);
+        setNftAssets(null);
 
         try {
           await switchToSepolia(waap);
@@ -476,6 +634,50 @@ export function AppShell() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!walletContextQuery.data?.walletContext) {
+      return;
+    }
+
+    setWalletContext(walletContextQuery.data.walletContext);
+
+    if (!activeAction) {
+      return;
+    }
+
+    const refreshedAction =
+      walletContextQuery.data.walletContext.recentActions.find(
+        (action) => action.id === activeAction.id,
+      ) ?? null;
+
+    if (refreshedAction) {
+      setActiveAction(refreshedAction);
+    }
+  }, [activeAction, walletContextQuery.data]);
+
+  useEffect(() => {
+    if (!walletNftsQuery.data?.nftAssets) {
+      return;
+    }
+
+    setNftAssets(walletNftsQuery.data.nftAssets);
+  }, [walletNftsQuery.data]);
+
+  useEffect(() => {
+    if (!mergedWalletContext?.nftAssets.length) {
+      setSelectedNftKey(null);
+      return;
+    }
+
+    const hasSelection = mergedWalletContext.nftAssets.some(
+      (asset) => getNftKey(asset) === selectedNftKey,
+    );
+
+    if (!selectedNftKey || !hasSelection) {
+      setSelectedNftKey(getNftKey(mergedWalletContext.nftAssets[0]));
+    }
+  }, [mergedWalletContext?.nftAssets, selectedNftKey]);
 
   async function executeAction(action: PendingWalletAction) {
     if (!walletAddress) {
@@ -514,6 +716,15 @@ export function AppShell() {
           method: "eth_sendTransaction",
           withPT: true,
           params: [toRpcTransaction(metadata.swapTx, walletAddress, confirmation.action.valueWei)],
+        })) as string;
+      } else if (
+        confirmation.action.type === "nft_transfer" &&
+        confirmation.action.metadata?.kind === "nft_transfer"
+      ) {
+        txHash = (await waap.request({
+          method: "eth_sendTransaction",
+          withPT: true,
+          params: [toRpcTransaction(confirmation.action.metadata.transferTx, walletAddress)],
         })) as string;
       } else {
         txHash = (await waap.request({
@@ -559,37 +770,57 @@ export function AppShell() {
     await executeAction(activeAction);
   }
 
+  async function handleCreateAction(payload: ActionDraftPayload) {
+    await draftActionMutation.mutateAsync(payload);
+  }
+
   async function handleSend(message: string) {
     await chatMutation.mutateAsync(message);
   }
 
   return (
     <main className="app-shell">
-      <section className="topbar">
-        <div className="topbar-copy">
-          <p className="eyebrow">Wallet-native copilot</p>
-          <h1>Chat, inspect, approve.</h1>
-          <p className="topbar-text">
-            The model stays server-side. Your wallet stays yours. Risky actions still require a
-            permission window.
+      <section className="hero-ribbon">
+        <div className="hero-ribbon-copy">
+          <p className="eyebrow">Private wallet concierge</p>
+          <h1>WaaP Agent</h1>
+          <p className="hero-ribbon-text">
+            Private by default, chat-first, and tuned for guided approvals instead of blind clicks.
           </p>
+          <button
+            aria-label="Toggle theme"
+            className="theme-toggle"
+            data-theme={resolvedTheme}
+            type="button"
+            onClick={toggleTheme}
+          >
+            <span className="theme-toggle-dot" aria-hidden="true" />
+            <span className="theme-toggle-copy">
+              <span>Theme</span>
+              <strong>{resolvedTheme === "dark" ? "Dark" : "Light"}</strong>
+            </span>
+          </button>
         </div>
-        <div className="topbar-metrics">
-          <article className="metric-card">
+        <div className="hero-ribbon-stats">
+          <article className="stat-chip">
             <span>Network</span>
             <strong>Sepolia</strong>
           </article>
-          <article className="metric-card">
-            <span>Wallet</span>
-            <strong>{walletAddress ? "Connected" : restoringSession ? "Restoring" : "Waiting"}</strong>
+          <article className="stat-chip">
+            <span>Session</span>
+            <strong>{walletAddress ? "Bound" : restoringSession ? "Restoring" : "Idle"}</strong>
           </article>
-          <article className="metric-card">
-            <span>Balance</span>
+          <article className="stat-chip">
+            <span>Portfolio</span>
+            <strong>
+              {mergedWalletContext
+                ? `${mergedWalletContext.tokenBalances.length} tokens · ${mergedWalletContext.nftAssets.length} NFTs`
+                : "--"}
+            </strong>
+          </article>
+          <article className="stat-chip">
+            <span>Live balance</span>
             <strong>{balanceQuery.data ? `${balanceQuery.data} ETH` : "--"}</strong>
-          </article>
-          <article className="metric-card">
-            <span>Action</span>
-            <strong>{activeAction ? activeAction.status.replace("_", " ") : "Idle"}</strong>
           </article>
         </div>
       </section>
@@ -597,25 +828,34 @@ export function AppShell() {
       <section className="workspace-grid">
         <WalletPanel
           address={walletAddress}
-          balanceEth={balanceQuery.data ?? null}
+          balanceEth={balanceQuery.data ?? mergedWalletContext?.nativeBalanceEth ?? null}
           connecting={connectMutation.isPending || disconnectMutation.isPending || restoringSession}
           connected={connected}
           error={connectError}
-          walletContext={walletContext}
+          nftLoading={walletNftsQuery.isLoading && !nftAssets}
+          nftRefreshing={walletNftsQuery.isRefetching}
+          selectedNftKey={selectedNftKey}
+          walletContext={mergedWalletContext}
           onConnect={() => connectMutation.mutate()}
           onDisconnect={() => disconnectMutation.mutate()}
+          onSelectNft={(nextKey) => setSelectedNftKey(nextKey)}
         />
         <ChatPanel
           busy={chatMutation.isPending}
           streaming={streamingAssistantActive}
           streamingMessage={streamingAssistantMessage}
+          streamingToolTrace={streamingToolTrace}
           messages={messages}
+          suggestions={suggestionPrompts}
           onSend={handleSend}
         />
         <ApprovalPanel
           key={activeAction?.id ?? "empty-approval"}
           action={activeAction}
           busy={combinedBusy}
+          selectedNft={selectedNft}
+          walletContext={mergedWalletContext}
+          onCreateAction={handleCreateAction}
           onGrantAndExecute={handleGrantAndExecute}
           onExecuteReady={() => (activeAction ? executeAction(activeAction) : Promise.resolve())}
         />

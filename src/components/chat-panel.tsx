@@ -1,21 +1,28 @@
 "use client";
 
-import { Fragment } from "react";
+import { Fragment, useState } from "react";
 import type { KeyboardEvent } from "react";
-import { useState } from "react";
 
-import type { ChatMessage } from "@/lib/types";
+import type { AgentToolTraceItem, ChatMessage } from "@/lib/types";
+
+type DisplayChatMessage = ChatMessage & {
+  toolTrace?: AgentToolTraceItem[];
+};
 
 interface ChatPanelProps {
   busy: boolean;
   streaming: boolean;
   streamingMessage: string;
-  messages: ChatMessage[];
+  streamingToolTrace: AgentToolTraceItem[];
+  messages: DisplayChatMessage[];
+  suggestions: string[];
   onSend: (message: string) => Promise<void> | void;
 }
 
 function renderMessageContent(content: string) {
-  return content.split("\n").map((line, lineIndex) => {
+  const lines = content.split("\n");
+
+  return lines.map((line, lineIndex) => {
     const segments = line.split(/(\*\*[^*]+\*\*)/g);
 
     return (
@@ -29,29 +36,77 @@ function renderMessageContent(content: string) {
 
           return <Fragment key={`${segment}-${segmentIndex}`}>{segment}</Fragment>;
         })}
-        {lineIndex < content.split("\n").length - 1 ? <br /> : null}
+        {lineIndex < lines.length - 1 ? <br /> : null}
       </Fragment>
     );
   });
+}
+
+function renderToolTrace(items: AgentToolTraceItem[], live = false) {
+  if (!items.length) {
+    return null;
+  }
+
+  const visibleItems = live ? items.slice(-3) : items;
+
+  return (
+    <section className={`tool-trace ${live ? "tool-trace-live" : ""}`}>
+      <div className="tool-trace-header">
+        <span>{live ? "Agent activity" : "Resolution path"}</span>
+        <strong>
+          {items.some((item) => item.status === "running")
+            ? "Working"
+            : `${items.length} step${items.length > 1 ? "s" : ""}`}
+        </strong>
+      </div>
+      <div className="tool-trace-list">
+        {visibleItems.map((item, index) => (
+          <article key={item.id} className={`tool-trace-item tool-trace-${item.status}`}>
+            <span className="tool-trace-rail" aria-hidden="true">
+              <span className="tool-trace-dot" />
+              {index < visibleItems.length - 1 ? <span className="tool-trace-line" /> : null}
+            </span>
+            <div className="tool-trace-copy">
+              <div className="tool-trace-title-row">
+                <strong>{item.label}</strong>
+                <em className="tool-trace-status">
+                  {item.status === "running"
+                    ? "Running"
+                    : item.status === "completed"
+                      ? "Done"
+                      : "Issue"}
+                </em>
+              </div>
+              {item.detail ? <p>{item.detail}</p> : null}
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
 }
 
 export function ChatPanel({
   busy,
   streaming,
   streamingMessage,
+  streamingToolTrace,
   messages,
+  suggestions,
   onSend,
 }: ChatPanelProps) {
   const [draft, setDraft] = useState("");
 
-  async function submit() {
-    const value = draft.trim();
+  async function submit(prefilled?: string) {
+    const value = (prefilled ?? draft).trim();
 
     if (!value || busy) {
       return;
     }
 
-    setDraft("");
+    if (!prefilled) {
+      setDraft("");
+    }
 
     try {
       await onSend(value);
@@ -71,21 +126,35 @@ export function ChatPanel({
 
   return (
     <section className="panel chat-panel">
-      <div className="panel-header">
+      <div className="panel-header chat-header">
         <div>
           <p className="eyebrow">Agent channel</p>
           <h2 className="section-title">Wallet copilot</h2>
+          <p className="micro-copy chat-header-copy">
+            Ask naturally, or use the quick prompts to inspect, swap, and prepare actions faster.
+          </p>
         </div>
+      </div>
+
+      <div className="suggestion-row">
+        {suggestions.map((suggestion) => (
+          <button
+            key={suggestion}
+            type="button"
+            className="suggestion-chip"
+            disabled={busy}
+            onClick={() => submit(suggestion)}
+          >
+            {suggestion}
+          </button>
+        ))}
       </div>
 
       <div className="chat-log">
         {messages.length === 0 ? (
           <div className="empty-state">
-            <p>Ask for your balance, preview a transfer, or swap ETH and USDC on Sepolia.</p>
-            <p>&quot;What is my balance?&quot;</p>
-            <p>&quot;Prepare 0.01 ETH to 0x...&quot;</p>
-            <p>&quot;Send 0.005 ETH to 0x...&quot;</p>
-            <p>&quot;Swap 0.01 ETH to USDC&quot;</p>
+            <p>Your wallet is live. The copilot can inspect balances, route swaps, and prepare NFT moves.</p>
+            <p>Use the tabs on the right for direct actions, or ask in chat.</p>
           </div>
         ) : (
           messages.map((message) => (
@@ -95,14 +164,19 @@ export function ChatPanel({
             >
               <p className="bubble-role">{message.role === "assistant" ? "Agent" : "You"}</p>
               <p>{renderMessageContent(message.content)}</p>
+              {message.role === "assistant" ? renderToolTrace(message.toolTrace ?? []) : null}
             </article>
           ))
         )}
         {streaming ? (
           <article className="bubble bubble-assistant bubble-streaming">
             <p className="bubble-role">Agent</p>
+            {renderToolTrace(streamingToolTrace, true)}
             {streamingMessage ? (
-              <p>{renderMessageContent(streamingMessage)}</p>
+              <p>
+                {renderMessageContent(streamingMessage)}
+                <span className="stream-cursor" aria-hidden="true" />
+              </p>
             ) : (
               <div className="thinking-indicator" aria-label="Agent is thinking">
                 <span />
@@ -119,12 +193,15 @@ export function ChatPanel({
           value={draft}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="Ask for balance, prepare a transfer, or tell the agent to send."
+          placeholder="Ask for balance, preview a transfer, inspect NFTs, or prepare a swap."
           rows={4}
         />
-        <button className="primary-button" onClick={submit} disabled={busy}>
-          {busy ? "Thinking..." : "Send message"}
-        </button>
+        <div className="composer-footer">
+          <p className="micro-copy">Enter sends. Shift+Enter adds a new line.</p>
+          <button className="primary-button" onClick={() => submit()} disabled={busy}>
+            {busy ? "Thinking..." : "Send message"}
+          </button>
+        </div>
       </div>
     </section>
   );

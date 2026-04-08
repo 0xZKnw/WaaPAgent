@@ -22,11 +22,39 @@ const chatSchema = z.object({
 const permissionSchema = z.object({
   actionId: z.string().optional(),
   chainId: z.number().int().default(SEPOLIA_CHAIN_ID),
-  actionType: z.union([z.literal("native_transfer"), z.literal("token_swap")]),
+  actionType: z.union([
+    z.literal("native_transfer"),
+    z.literal("token_swap"),
+    z.literal("nft_transfer"),
+  ]),
   allowedAddresses: z.array(z.string()).min(1),
   maxAmountUsd: z.string().min(1),
   requestedExpirySeconds: z.number().int().min(60).max(7200),
 });
+
+const actionDraftSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("native_transfer"),
+    toAddress: z.string().min(1),
+    amountEth: z.string().min(1),
+    reason: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal("token_swap"),
+    tokenIn: z.string().min(1),
+    tokenOut: z.string().min(1),
+    amount: z.string().min(1),
+    reason: z.string().optional(),
+  }),
+  z.object({
+    type: z.literal("nft_transfer"),
+    contractAddress: z.string().min(1),
+    tokenId: z.string().min(1),
+    toAddress: z.string().min(1),
+    quantity: z.string().min(1).optional(),
+    reason: z.string().optional(),
+  }),
+]);
 
 const actionCompletionSchema = z.object({
   status: z.union([z.literal("completed"), z.literal("failed")]),
@@ -133,6 +161,28 @@ export async function handleWalletContextRequest(
   };
 }
 
+export async function handleWalletNftsRequest(
+  sessionToken: string | undefined,
+  overrides?: Partial<Dependencies>,
+) {
+  if (!sessionToken) {
+    throw new Error("Missing session.");
+  }
+
+  const deps = getDependencies(overrides);
+  const session = deps.sessionService.getSession(sessionToken);
+
+  if (!session) {
+    throw new Error("Session expired. Please reconnect your wallet.");
+  }
+
+  const nftAssets = await deps.walletService.getWalletNfts(session);
+
+  return {
+    nftAssets,
+  };
+}
+
 export async function handleChatRequest(
   sessionToken: string | undefined,
   body: ChatRequest | unknown,
@@ -163,6 +213,36 @@ export async function handlePermissionGrantRequest(
   const walletContext = await deps.walletService.getWalletContext(session);
 
   return { grant, walletContext };
+}
+
+export async function handleActionDraftRequest(
+  sessionToken: string | undefined,
+  body: unknown,
+  overrides?: Partial<Dependencies>,
+) {
+  if (!sessionToken) {
+    throw new Error("Missing session.");
+  }
+
+  const deps = getDependencies(overrides);
+  const session = deps.sessionService.getSession(sessionToken);
+
+  if (!session) {
+    throw new Error("Session expired. Please reconnect your wallet.");
+  }
+
+  const parsed = actionDraftSchema.parse(body);
+
+  const action =
+    parsed.type === "native_transfer"
+      ? await deps.walletService.createPendingTransfer(session, parsed)
+      : parsed.type === "token_swap"
+        ? await deps.walletService.createPendingSwap(session, parsed)
+        : await deps.walletService.createPendingNftTransfer(session, parsed);
+
+  const walletContext = await deps.walletService.getWalletContext(session);
+
+  return { action, walletContext };
 }
 
 export async function handleConfirmActionRequest(

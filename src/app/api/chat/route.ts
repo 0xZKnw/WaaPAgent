@@ -40,6 +40,9 @@ export async function POST(request: Request) {
 
                 writeChunk({ type: "delta", delta });
               },
+              (event) => {
+                writeChunk({ type: "tool", event });
+              },
             );
 
             writeChunk({ type: "final", response });

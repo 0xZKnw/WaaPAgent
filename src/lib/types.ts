@@ -1,5 +1,6 @@
 export type ChatRole = "user" | "assistant";
-export type WalletActionType = "native_transfer" | "token_swap";
+export type WalletActionType = "native_transfer" | "token_swap" | "nft_transfer";
+export type AgentToolTraceStatus = "running" | "completed" | "failed";
 
 export interface ChatRequest {
   message: string;
@@ -50,6 +51,30 @@ export interface WalletTokenBalance {
   usdValue?: string | null;
 }
 
+export interface SupportedSwapToken {
+  chainId: number;
+  symbol: string;
+  name: string;
+  address: string;
+  decimals: number;
+  isNative?: boolean;
+}
+
+export interface WalletNftAsset {
+  contractAddress: string;
+  tokenId: string;
+  tokenType: "ERC-721" | "ERC-1155" | string;
+  collectionName: string;
+  collectionSymbol: string;
+  name: string;
+  description?: string | null;
+  balance: string;
+  isUnique: boolean;
+  imageUrl?: string | null;
+  animationUrl?: string | null;
+  externalUrl?: string | null;
+}
+
 export interface SwapActionMetadata {
   kind: "token_swap";
   protocol: "uniswap";
@@ -68,6 +93,21 @@ export interface SwapActionMetadata {
   approvalTx: PreparedOnchainTransaction | null;
   swapTx: PreparedOnchainTransaction;
 }
+
+export interface NftTransferActionMetadata {
+  kind: "nft_transfer";
+  tokenType: "ERC-721" | "ERC-1155";
+  contractAddress: string;
+  tokenId: string;
+  quantity: string;
+  collectionName: string;
+  collectionSymbol: string;
+  assetName: string;
+  imageUrl?: string | null;
+  transferTx: PreparedOnchainTransaction;
+}
+
+export type WalletActionMetadata = SwapActionMetadata | NftTransferActionMetadata;
 
 export type PendingWalletActionStatus =
   | "needs_approval"
@@ -91,7 +131,7 @@ export interface PendingWalletAction {
   txHash?: string | null;
   error?: string | null;
   permissionGrantId?: string | null;
-  metadata?: SwapActionMetadata | null;
+  metadata?: WalletActionMetadata | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -103,15 +143,26 @@ export interface WalletContext {
   nativeBalanceWei: string;
   nativeBalanceEth: string;
   tokenBalances: WalletTokenBalance[];
+  nftAssets: WalletNftAsset[];
   swapAvailable: boolean;
+  supportedSwapTokens: SupportedSwapToken[];
   activePermission: PermissionGrant | null;
   recentActions: PendingWalletAction[];
+}
+
+export interface AgentToolTraceItem {
+  id: string;
+  name: string;
+  label: string;
+  detail?: string | null;
+  status: AgentToolTraceStatus;
 }
 
 export interface ChatResponse {
   message: string;
   walletContext: WalletContext;
   pendingAction: PendingWalletAction | null;
+  toolTrace?: AgentToolTraceItem[];
 }
 
 export interface WalletActionResult {

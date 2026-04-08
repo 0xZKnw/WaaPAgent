@@ -2,6 +2,23 @@ import { expect, test } from "@playwright/test";
 
 const walletAddress = "0x1111111111111111111111111111111111111111";
 const targetAddress = "0x2222222222222222222222222222222222222222";
+const supportedSwapTokens = [
+  {
+    chainId: 11155111,
+    symbol: "ETH",
+    name: "Ether",
+    address: "0x0000000000000000000000000000000000000000",
+    decimals: 18,
+    isNative: true,
+  },
+  {
+    chainId: 11155111,
+    symbol: "USDC",
+    name: "USD Coin",
+    address: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+    decimals: 6,
+  },
+];
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(
@@ -30,6 +47,34 @@ test.beforeEach(async ({ page }) => {
     },
     [walletAddress],
   );
+
+  await page.route("**/api/wallet/context", async (route) => {
+    await route.fulfill({
+      json: {
+        walletContext: {
+          address: walletAddress,
+          chainId: 11155111,
+          chainName: "Sepolia",
+          nativeBalanceWei: "10000000000000000",
+          nativeBalanceEth: "0.01",
+          tokenBalances: [],
+          nftAssets: [],
+          swapAvailable: true,
+          supportedSwapTokens,
+          activePermission: null,
+          recentActions: [],
+        },
+      },
+    });
+  });
+
+  await page.route("**/api/wallet/nfts", async (route) => {
+    await route.fulfill({
+      json: {
+        nftAssets: [],
+      },
+    });
+  });
 });
 
 test("connects the wallet and shows the balance shell", async ({ page }) => {
@@ -63,7 +108,9 @@ test("sends a balance question through the chat panel", async ({ page }) => {
           nativeBalanceWei: "10000000000000000",
           nativeBalanceEth: "0.01",
           tokenBalances: [],
-      swapAvailable: true,
+          nftAssets: [],
+          swapAvailable: true,
+          supportedSwapTokens,
           activePermission: null,
           recentActions: [],
         },
@@ -103,7 +150,9 @@ test("grants permission and completes a transfer flow", async ({ page }) => {
           nativeBalanceWei: "10000000000000000",
           nativeBalanceEth: "0.01",
           tokenBalances: [],
-      swapAvailable: true,
+          nftAssets: [],
+          swapAvailable: true,
+          supportedSwapTokens,
           activePermission: null,
           recentActions: [],
         },
@@ -140,7 +189,9 @@ test("grants permission and completes a transfer flow", async ({ page }) => {
           nativeBalanceWei: "10000000000000000",
           nativeBalanceEth: "0.01",
           tokenBalances: [],
-      swapAvailable: true,
+          nftAssets: [],
+          swapAvailable: true,
+          supportedSwapTokens,
           activePermission: {
             id: "grant-1",
             chainId: 11155111,
@@ -186,7 +237,9 @@ test("grants permission and completes a transfer flow", async ({ page }) => {
           nativeBalanceWei: "10000000000000000",
           nativeBalanceEth: "0.01",
           tokenBalances: [],
-      swapAvailable: true,
+          nftAssets: [],
+          swapAvailable: true,
+          supportedSwapTokens,
           activePermission: null,
           recentActions: [],
         },
@@ -223,7 +276,9 @@ test("grants permission and completes a transfer flow", async ({ page }) => {
           nativeBalanceWei: "9000000000000000",
           nativeBalanceEth: "0.009",
           tokenBalances: [],
-      swapAvailable: true,
+          nftAssets: [],
+          swapAvailable: true,
+          supportedSwapTokens,
           activePermission: null,
           recentActions: [],
         },

@@ -21,8 +21,8 @@ import {
   UNISWAP_V3_FEE_TIERS,
 } from "@/lib/constants";
 import { env } from "@/lib/env";
-import { listSupportedSwapTokens, resolveSupportedToken, type SupportedToken } from "@/lib/tokens";
-import type { PreparedOnchainTransaction } from "@/lib/types";
+import { listSupportedSwapTokens, resolveSupportedToken } from "@/lib/tokens";
+import type { PreparedOnchainTransaction, SupportedSwapToken } from "@/lib/types";
 
 interface QuoteCandidate {
   amountOut: bigint;
@@ -39,8 +39,8 @@ export interface ExactInputSwapIntent {
 }
 
 export interface ExactInputSwapQuote {
-  tokenIn: SupportedToken;
-  tokenOut: SupportedToken;
+  tokenIn: SupportedSwapToken;
+  tokenOut: SupportedSwapToken;
   amountInRaw: string;
   amountInDisplay: string;
   quotedAmountOutRaw: string;
@@ -92,7 +92,9 @@ export class UniswapTradeService {
     const token = resolveSupportedToken(input);
 
     if (!token) {
-      throw new Error("Unsupported swap token. For now, swaps are limited to ETH and USDC on Sepolia.");
+      throw new Error(
+        "Unsupported swap token. For now, swaps are limited to the supported Sepolia allowlist.",
+      );
     }
 
     return token;
@@ -159,7 +161,7 @@ export class UniswapTradeService {
     };
   }
 
-  private estimateInputValueUsd(tokenIn: SupportedToken, amountDisplay: string) {
+  private estimateInputValueUsd(tokenIn: SupportedSwapToken, amountDisplay: string) {
     const amount = Number(amountDisplay);
 
     if (!Number.isFinite(amount) || amount <= 0) {
